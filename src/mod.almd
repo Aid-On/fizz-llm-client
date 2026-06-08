@@ -1,0 +1,351 @@
+// fizz_llm_client — マルチプロバイダ LLM クライアント。
+//
+// 責務 (一行): messages を LLM 応答に変換する (provider 抽象 + adapter)。
+//
+// これは §3 の llm-client + llm-adapter:* を 1 部品にまとめたもの。
+// 本来は almide-ai/almai を使う計画だったが、almai は 2026-05 以降
+// メンテされておらず現行 almide (v0.24/v0.25) でコンパイルできない
+// (streaming callback closure の codegen 不整合 + Value Repr 欠落)。
+// そこで almai と同形の interface (Message / LLMResponse / call / call_with /
+// CallOptions ビルダー) を stdlib http.request の上に自前実装した。
+// almai が現行 almide で通るようになったら、このパッケージを almai に
+// 差し替えるだけで orchestrator 側は無改修で済む形にしてある。
+//
+// 制約: almide v0.25 は streaming callback (http.*_streaming_call) が
+// codegen バグで壊れているため、**非ストリーミング** (http.request POST で
+// 全文受信) で実装している。first-audio latency の最適化 (ストリーミング) は
+// almide 修正後に call_streaming を足す。
+//
+// model_spec 形式 (almai 互換): "<provider>/<model>"
+//   anthropic/claude-haiku-4-5
+//   openai/gpt-4o
+//   openrouter/meta-llama/llama-3.3-70b-instruct
+//   groq/llama-3.3-70b-versatile
+
+import json
+import http
+import env
+
+// ── 型 (almai 互換) ──────────────────────────────────────────────────
+
+type Message = {
+  // "system" | "user" | "assistant"
+  role: String,
+  content: String,
+}
+
+type Usage = {
+  prompt_tokens: Int,
+  completion_tokens: Int,
+  total_tokens: Int,
+}
+
+type LLMResponse = {
+  content: String,
+  model: String,
+  usage: Usage,
+  finish_reason: String,
+}
+
+type CallOptions = {
+  max_tokens: Int,
+  temperature: Float,
+  top_p: Float,
+  // 追加 system prompt (messages 内の system より優先で先頭に積む)。
+  system: String,
+  stop: List[String],
+  json_mode: Bool,
+}
+
+// ── メッセージビルダー ───────────────────────────────────────────────
+
+fn system(content: String) -> Message = Message { role: "system", content: content }
+fn user(content: String) -> Message = Message { role: "user", content: content }
+fn assistant(content: String) -> Message = Message { role: "assistant", content: content }
+
+// ── オプションビルダー ───────────────────────────────────────────────
+
+fn defaults() -> CallOptions =
+  CallOptions { max_tokens: 1024, temperature: 1.0, top_p: 1.0, system: "", stop: [], json_mode: false }
+
+fn with_max_tokens(o: CallOptions, n: Int) -> CallOptions = { ...o, max_tokens: n }
+fn with_temperature(o: CallOptions, t: Float) -> CallOptions = { ...o, temperature: t }
+fn with_top_p(o: CallOptions, p: Float) -> CallOptions = { ...o, top_p: p }
+fn with_system(o: CallOptions, s: String) -> CallOptions = { ...o, system: s }
+fn with_stop(o: CallOptions, seqs: List[String]) -> CallOptions = { ...o, stop: seqs }
+fn with_json_mode(o: CallOptions) -> CallOptions = { ...o, json_mode: true }
+
+// ── provider 解析 ────────────────────────────────────────────────────
+
+type Provider =
+  | Anthropic
+  | OpenAI
+  | OpenRouter
+  | Groq
+
+fn provider_from_prefix(prefix: String) -> Result[Provider, String] = match prefix {
+  "anthropic"  => ok(Anthropic),
+  "openai"     => ok(OpenAI),
+  "openrouter" => ok(OpenRouter),
+  "groq"       => ok(Groq),
+  _            => err("unknown LLM provider: ${prefix}"),
+}
+
+// "anthropic/claude-haiku-4-5" → (Anthropic, "claude-haiku-4-5")
+// "openrouter/meta-llama/llama-3.3" → (OpenRouter, "meta-llama/llama-3.3")
+fn parse_provider(model_spec: String) -> Result[(Provider, String), String] = {
+  let parts = string.split(model_spec, "/")
+  guard list.len(parts) >= 2 else err("model spec must be '<provider>/<model>': ${model_spec}")
+  let prefix = list.first(parts) ?? ""
+  let model = string.join(list.drop(parts, 1), "/")
+  match provider_from_prefix(prefix) {
+    ok(p)  => ok((p, model)),
+    err(e) => err(e),
+  }
+}
+
+// ── リクエストボディ構築 (pure) ──────────────────────────────────────
+
+// system + messages を「先頭 system を集約 + 残りを user/assistant」に整理。
+local fn collect_system(msgs: List[Message], extra: String) -> String = {
+  let from_msgs = list.fold(msgs, "", (acc, m) =>
+    if m.role == "system" then
+      (if acc == "" then m.content else "${acc}\n${m.content}")
+    else acc)
+  if extra == "" then from_msgs
+  else if from_msgs == "" then extra
+  else "${extra}\n${from_msgs}"
+}
+
+local fn non_system(msgs: List[Message]) -> List[Message] =
+  list.filter(msgs, (m) => m.role != "system")
+
+local fn msg_to_value(m: Message) -> Value =
+  value.object([("role", value.str(m.role)), ("content", value.str(m.content))])
+
+// Anthropic Messages API: system は top-level、messages は user/assistant のみ。
+fn build_anthropic_body(model: String, msgs: List[Message], opts: CallOptions) -> String = {
+  let sys = collect_system(msgs, opts.system)
+  let base = [
+    ("model", value.str(model)),
+    ("max_tokens", value.int(opts.max_tokens)),
+    ("temperature", value.float(opts.temperature)),
+    ("messages", value.array(list.map(non_system(msgs), msg_to_value))),
+  ]
+  let with_sys = if sys == "" then base else base + [("system", value.str(sys))]
+  let with_stop = if list.is_empty(opts.stop) then with_sys
+                  else with_sys + [("stop_sequences", value.array(list.map(opts.stop, (s) => value.str(s))))]
+  json.stringify(value.object(with_stop))
+}
+
+// OpenAI 互換 (OpenAI / OpenRouter / Groq): system も messages 配列に含める。
+fn build_openai_body(model: String, msgs: List[Message], opts: CallOptions) -> String = {
+  let sys = collect_system(msgs, opts.system)
+  let head: List[Message] = if sys == "" then [] else [system(sys)]
+  let all_msgs = head + non_system(msgs)
+  let base = [
+    ("model", value.str(model)),
+    ("max_tokens", value.int(opts.max_tokens)),
+    ("temperature", value.float(opts.temperature)),
+    ("messages", value.array(list.map(all_msgs, msg_to_value))),
+  ]
+  let with_stop = if list.is_empty(opts.stop) then base
+                  else base + [("stop", value.array(list.map(opts.stop, (s) => value.str(s))))]
+  let with_json = if opts.json_mode then
+                    with_stop + [("response_format", value.object([("type", value.str("json_object"))]))]
+                  else with_stop
+  json.stringify(value.object(with_json))
+}
+
+// ── レスポンス解析 (pure) ────────────────────────────────────────────
+
+local fn jget(v: Value, key: String) -> Value = value.get(v, key) ?? value.null()
+
+local fn jstr(v: Value, key: String) -> String =
+  result.unwrap_or(value.as_string(jget(v, key)), "")
+
+local fn jint(v: Value, key: String) -> Int =
+  result.unwrap_or(value.as_int(jget(v, key)), 0)
+
+local fn jarr(v: Value, key: String) -> List[Value] =
+  result.unwrap_or(value.as_array(jget(v, key)), [])
+
+// Anthropic: {"content":[{"type":"text","text":"..."}],"model":..,
+//             "usage":{"input_tokens":N,"output_tokens":M},"stop_reason":".."}
+fn parse_anthropic_response(body: String) -> Result[LLMResponse, String] =
+  match json.parse(body) {
+    err(e) => err("invalid json: ${e}"),
+    ok(v)  => {
+      let api_err = jget(v, "error")
+      if api_err != value.null() then err("anthropic api error: ${jstr(api_err, "message")}")
+      else {
+        let text = list.fold(jarr(v, "content"), "", (acc, block) =>
+          if jstr(block, "type") == "text" then acc + jstr(block, "text") else acc)
+        let usage = jget(v, "usage")
+        let pt = jint(usage, "input_tokens")
+        let ct = jint(usage, "output_tokens")
+        ok(LLMResponse {
+          content: text,
+          model: jstr(v, "model"),
+          usage: Usage { prompt_tokens: pt, completion_tokens: ct, total_tokens: pt + ct },
+          finish_reason: jstr(v, "stop_reason"),
+        })
+      }
+    },
+  }
+
+// OpenAI 互換: {"choices":[{"message":{"content":".."},"finish_reason":".."}],
+//               "model":..,"usage":{"prompt_tokens":N,"completion_tokens":M,"total_tokens":T}}
+fn parse_openai_response(body: String) -> Result[LLMResponse, String] =
+  match json.parse(body) {
+    err(e) => err("invalid json: ${e}"),
+    ok(v)  => {
+      let api_err = jget(v, "error")
+      if api_err != value.null() then err("openai api error: ${jstr(api_err, "message")}")
+      else match list.first(jarr(v, "choices")) {
+        none        => err("openai response had no choices"),
+        some(choice) => {
+          let usage = jget(v, "usage")
+          ok(LLMResponse {
+            content: jstr(jget(choice, "message"), "content"),
+            model: jstr(v, "model"),
+            usage: Usage {
+              prompt_tokens: jint(usage, "prompt_tokens"),
+              completion_tokens: jint(usage, "completion_tokens"),
+              total_tokens: jint(usage, "total_tokens"),
+            },
+            finish_reason: jstr(choice, "finish_reason"),
+          })
+        },
+      }
+    },
+  }
+
+// ── エンドポイント / 認証 (pure 部分) ────────────────────────────────
+
+fn openai_base_url(p: Provider) -> String = match p {
+  OpenAI     => "https://api.openai.com/v1",
+  OpenRouter => "https://openrouter.ai/api/v1",
+  Groq       => "https://api.groq.com/openai/v1",
+  Anthropic  => "https://api.anthropic.com/v1",  // 未使用 (anthropic は別経路)
+}
+
+fn api_key_env(p: Provider) -> String = match p {
+  Anthropic  => "ANTHROPIC_API_KEY",
+  OpenAI     => "OPENAI_API_KEY",
+  OpenRouter => "OPENROUTER_API_KEY",
+  Groq       => "GROQ_API_KEY",
+}
+
+// ── ディスパッチ (effect) ────────────────────────────────────────────
+
+effect fn require_env(key: String) -> Result[String, String] = {
+  let v = string.trim(env.get(key) ?? "")
+  guard v != "" else err("missing env: ${key}")
+  ok(v)
+}
+
+effect fn call_with(model_spec: String, msgs: List[Message], opts: CallOptions) -> Result[LLMResponse, String] = {
+  let parsed = parse_provider(model_spec)!
+  let provider = parsed.0
+  let model = parsed.1
+  let key = require_env(api_key_env(provider))!
+  match provider {
+    Anthropic => {
+      let body = build_anthropic_body(model, msgs, opts)
+      let headers = [
+        "x-api-key": key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      ]
+      let resp = http.request("POST", "https://api.anthropic.com/v1/messages", body, headers)!
+      ok(parse_anthropic_response(resp)!)
+    },
+    _ => {
+      let body = build_openai_body(model, msgs, opts)
+      let headers = [
+        "authorization": "Bearer ${key}",
+        "content-type": "application/json",
+      ]
+      let resp = http.request("POST", "${openai_base_url(provider)}/chat/completions", body, headers)!
+      ok(parse_openai_response(resp)!)
+    },
+  }
+}
+
+effect fn call(model_spec: String, msgs: List[Message]) -> Result[LLMResponse, String] =
+  call_with(model_spec, msgs, defaults())
+
+// ── in-file tests (pure 部分のみ — ネットワーク不要) ─────────────────
+
+test "provider parsing" {
+  assert_eq(parse_provider("anthropic/claude-haiku-4-5"), ok((Anthropic, "claude-haiku-4-5")))
+  assert_eq(parse_provider("openrouter/meta-llama/llama-3.3"), ok((OpenRouter, "meta-llama/llama-3.3")))
+  assert_eq(parse_provider("groq/llama-3.3-70b-versatile"), ok((Groq, "llama-3.3-70b-versatile")))
+  assert(result.is_err(parse_provider("just-a-model")))
+  assert(result.is_err(parse_provider("ollama/llama")))
+}
+
+test "option builders" {
+  let o = defaults() |> with_max_tokens(512) |> with_temperature(0.7) |> with_json_mode
+  assert_eq(o.max_tokens, 512)
+  assert_eq(o.temperature, 0.7)
+  assert(o.json_mode)
+}
+
+test "anthropic body lifts system out of messages" {
+  let msgs = [system("be terse"), user("hi"), assistant("yo"), user("bye")]
+  let body = build_anthropic_body("claude-haiku-4-5", msgs, defaults())
+  assert(string.contains(body, "\"system\":\"be terse\""))
+  // system は messages 配列から除外される
+  assert(not string.contains(body, "{\"role\":\"system\""))
+  assert(string.contains(body, "\"role\":\"user\""))
+}
+
+test "openai body keeps system in the messages array" {
+  let msgs = [system("be terse"), user("hi")]
+  let body = build_openai_body("gpt-4o", msgs, defaults() |> with_json_mode)
+  assert(string.contains(body, "{\"role\":\"system\",\"content\":\"be terse\"}"))
+  assert(string.contains(body, "json_object"))
+}
+
+test "with_system prepends to message-level system" {
+  let body = build_anthropic_body("m", [system("inner")], defaults() |> with_system("outer"))
+  assert(string.contains(body, "outer\\ninner"))
+}
+
+test "anthropic response parsing" {
+  let body = r"""
+    {"content":[{"type":"text","text":"こんにちは"},{"type":"text","text":"！"}],
+     "model":"claude-haiku-4-5","stop_reason":"end_turn",
+     "usage":{"input_tokens":10,"output_tokens":5}}
+  """
+  match parse_anthropic_response(body) {
+    ok(r) => {
+      assert_eq(r.content, "こんにちは！")
+      assert_eq(r.finish_reason, "end_turn")
+      assert_eq(r.usage.total_tokens, 15)
+    },
+    err(e) => { eprintln(e); assert(false) },
+  }
+}
+
+test "openai response parsing" {
+  let body = r"""
+    {"choices":[{"message":{"role":"assistant","content":"hi there"},"finish_reason":"stop"}],
+     "model":"gpt-4o","usage":{"prompt_tokens":8,"completion_tokens":3,"total_tokens":11}}
+  """
+  match parse_openai_response(body) {
+    ok(r) => {
+      assert_eq(r.content, "hi there")
+      assert_eq(r.usage.total_tokens, 11)
+    },
+    err(e) => { eprintln(e); assert(false) },
+  }
+}
+
+test "api errors surface" {
+  assert(result.is_err(parse_anthropic_response("{\"error\":{\"message\":\"overloaded\"}}")))
+  assert(result.is_err(parse_openai_response("{\"error\":{\"message\":\"bad key\"}}")))
+  assert(result.is_err(parse_openai_response("{\"choices\":[]}")))
+}
