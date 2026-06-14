@@ -11,10 +11,12 @@
 // almai が現行 almide で通るようになったら、このパッケージを almai に
 // 差し替えるだけで orchestrator 側は無改修で済む形にしてある。
 //
-// 制約: almide v0.25 は streaming callback (http.*_streaming_call) が
-// codegen バグで壊れているため、**非ストリーミング** (http.request POST で
-// 全文受信) で実装している。first-audio latency の最適化 (ストリーミング) は
-// almide 修正後に call_streaming を足す。
+// 非ストリーミング (call / call_with) は http.request POST で全文受信。
+// ストリーミング (call_streaming / call_streaming_with) は http.*_streaming_call
+// で本文差分を on_delta に逐次渡しつつ最終 LLMResponse を返す。下流 (文分割 →
+// TTS) が生成完了を待たず最初の文から喋り出せるので first-audio latency を縮める。
+// (旧 almide v0.24/v0.25 は streaming callback の codegen バグで非ストリーミング
+//  のみだったが、現行 almide で解消 — almide/almide#408。)
 //
 // model_spec 形式 (almai 互換): "<provider>/<model>"
 //   anthropic/claude-haiku-4-5
@@ -124,7 +126,7 @@ local fn msg_to_value(m: Message) -> Value =
   value.object([("role", value.str(m.role)), ("content", value.str(m.content))])
 
 // Anthropic Messages API: system は top-level、messages は user/assistant のみ。
-fn build_anthropic_body(model: String, msgs: List[Message], opts: CallOptions) -> String = {
+fn build_anthropic_body(model: String, msgs: List[Message], opts: CallOptions, stream: Bool) -> String = {
   let sys = collect_system(msgs, opts.system)
   let base = [
     ("model", value.str(model)),
@@ -135,11 +137,13 @@ fn build_anthropic_body(model: String, msgs: List[Message], opts: CallOptions) -
   let with_sys = if sys == "" then base else base + [("system", value.str(sys))]
   let with_stop = if list.is_empty(opts.stop) then with_sys
                   else with_sys + [("stop_sequences", value.array(list.map(opts.stop, (s) => value.str(s))))]
-  json.stringify(value.object(with_stop))
+  // SSE には body に "stream": true が要る (Anthropic Messages API)。
+  let with_stream = if stream then with_stop + [("stream", value.bool(true))] else with_stop
+  json.stringify(value.object(with_stream))
 }
 
 // OpenAI 互換 (OpenAI / OpenRouter / Groq): system も messages 配列に含める。
-fn build_openai_body(model: String, msgs: List[Message], opts: CallOptions) -> String = {
+fn build_openai_body(model: String, msgs: List[Message], opts: CallOptions, stream: Bool) -> String = {
   let sys = collect_system(msgs, opts.system)
   let head: List[Message] = if sys == "" then [] else [system(sys)]
   let all_msgs = head + non_system(msgs)
@@ -154,7 +158,9 @@ fn build_openai_body(model: String, msgs: List[Message], opts: CallOptions) -> S
   let with_json = if opts.json_mode then
                     with_stop + [("response_format", value.object([("type", value.str("json_object"))]))]
                   else with_stop
-  json.stringify(value.object(with_json))
+  // OpenAI 互換も SSE には body に "stream": true が要る。
+  let with_stream = if stream then with_json + [("stream", value.bool(true))] else with_json
+  json.stringify(value.object(with_stream))
 }
 
 // ── レスポンス解析 (pure) ────────────────────────────────────────────
@@ -252,7 +258,7 @@ effect fn call_with(model_spec: String, msgs: List[Message], opts: CallOptions) 
   let key = require_env(api_key_env(provider))!
   match provider {
     Anthropic => {
-      let body = build_anthropic_body(model, msgs, opts)
+      let body = build_anthropic_body(model, msgs, opts, false)
       let headers = [
         "x-api-key": key,
         "anthropic-version": "2023-06-01",
@@ -262,7 +268,7 @@ effect fn call_with(model_spec: String, msgs: List[Message], opts: CallOptions) 
       ok(parse_anthropic_response(resp)!)
     },
     _ => {
-      let body = build_openai_body(model, msgs, opts)
+      let body = build_openai_body(model, msgs, opts, false)
       let headers = [
         "authorization": "Bearer ${key}",
         "content-type": "application/json",
@@ -275,6 +281,60 @@ effect fn call_with(model_spec: String, msgs: List[Message], opts: CallOptions) 
 
 effect fn call(model_spec: String, msgs: List[Message]) -> Result[LLMResponse, String] =
   call_with(model_spec, msgs, defaults())
+
+// ── ストリーミング ───────────────────────────────────────────────────
+//
+// runtime (http.*_streaming_call) は SSE を読みながら on_delta に本文の差分を
+// 逐次渡し、最後に LLMResponse 形の正規化 JSON を返す:
+//   {"content":..,"model":..,"usage":{prompt/completion/total_tokens},"finish_reason":..}
+// → 下流 (文分割 → TTS) が生成完了を待たずに最初の文から喋り出せる。
+
+fn parse_streaming_response(body: String) -> Result[LLMResponse, String] =
+  match json.parse(body) {
+    err(e) => err("invalid json: ${e}"),
+    ok(v)  => {
+      let usage = jget(v, "usage")
+      ok(LLMResponse {
+        content: jstr(v, "content"),
+        model: jstr(v, "model"),
+        usage: Usage {
+          prompt_tokens: jint(usage, "prompt_tokens"),
+          completion_tokens: jint(usage, "completion_tokens"),
+          total_tokens: jint(usage, "total_tokens"),
+        },
+        finish_reason: jstr(v, "finish_reason"),
+      })
+    },
+  }
+
+// ストリーミング呼び出し。本文の差分が届くたびに on_delta が呼ばれ、終了後に
+// 蓄積済みの LLMResponse を返す。call_with と同じ provider 解決 / body 構築。
+effect fn call_streaming_with(
+  model_spec: String, msgs: List[Message], opts: CallOptions,
+  on_delta: (String) -> Unit,
+) -> Result[LLMResponse, String] = {
+  let parsed = parse_provider(model_spec)!
+  let provider = parsed.0
+  let model = parsed.1
+  let key = require_env(api_key_env(provider))!
+  match provider {
+    Anthropic => {
+      let body = build_anthropic_body(model, msgs, opts, true)
+      let raw = http.anthropic_streaming_call(key, body, on_delta)!
+      ok(parse_streaming_response(raw)!)
+    },
+    _ => {
+      let body = build_openai_body(model, msgs, opts, true)
+      let raw = http.openai_streaming_call(openai_base_url(provider), key, body, on_delta)!
+      ok(parse_streaming_response(raw)!)
+    },
+  }
+}
+
+effect fn call_streaming(
+  model_spec: String, msgs: List[Message], on_delta: (String) -> Unit,
+) -> Result[LLMResponse, String] =
+  call_streaming_with(model_spec, msgs, defaults(), on_delta)
 
 // ── in-file tests (pure 部分のみ — ネットワーク不要) ─────────────────
 
@@ -295,22 +355,29 @@ test "option builders" {
 
 test "anthropic body lifts system out of messages" {
   let msgs = [system("be terse"), user("hi"), assistant("yo"), user("bye")]
-  let body = build_anthropic_body("claude-haiku-4-5", msgs, defaults())
+  let body = build_anthropic_body("claude-haiku-4-5", msgs, defaults(), false)
   assert(string.contains(body, "\"system\":\"be terse\""))
   // system は messages 配列から除外される
   assert(not string.contains(body, "{\"role\":\"system\""))
   assert(string.contains(body, "\"role\":\"user\""))
 }
 
+test "stream flag adds \"stream\":true to the body" {
+  let body = build_anthropic_body("m", [user("hi")], defaults(), true)
+  assert(string.contains(body, "\"stream\":true"))
+  let nostream = build_openai_body("gpt-4o", [user("hi")], defaults(), false)
+  assert(not string.contains(nostream, "\"stream\""))
+}
+
 test "openai body keeps system in the messages array" {
   let msgs = [system("be terse"), user("hi")]
-  let body = build_openai_body("gpt-4o", msgs, defaults() |> with_json_mode)
+  let body = build_openai_body("gpt-4o", msgs, defaults() |> with_json_mode, false)
   assert(string.contains(body, "{\"role\":\"system\",\"content\":\"be terse\"}"))
   assert(string.contains(body, "json_object"))
 }
 
 test "with_system prepends to message-level system" {
-  let body = build_anthropic_body("m", [system("inner")], defaults() |> with_system("outer"))
+  let body = build_anthropic_body("m", [system("inner")], defaults() |> with_system("outer"), false)
   assert(string.contains(body, "outer\\ninner"))
 }
 
